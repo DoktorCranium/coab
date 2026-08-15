@@ -14,7 +14,7 @@ On OpenVMS 8.4 SDL-1.2 is needed.
 OpenVMS 
 =======
 
-## Build amd rum 
+## Build amd run
 
 Make sure you have SDL-1.2 installed and setup
 
