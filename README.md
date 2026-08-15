@@ -2,7 +2,9 @@
 
 This is a C port of the reverse-engineered CoAB engine originally created by 
 Simeon Pilgrim in C# for Windows. 
+
 https://simeonpilgrim.com/blog/curse-of-the-azure-bonds
+
 https://github.com/simeonpilgrim/coab
 
 It is ported to C99 and SDL2 for Linux/UNIX. 
