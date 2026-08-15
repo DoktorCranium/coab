@@ -18,14 +18,12 @@ OpenVMS
 
 Make sure you have SDL-1.2 installed and setup
 
+```
 @configure.com 
-
 @build 
-
 coab :== $DISK:[PATH]COAB.EXE 
-
 coab --scale 2 
-
+```
 
 
 UNIX/Linux 
@@ -36,6 +34,7 @@ UNIX/Linux
 Three ways in, all producing the same binary. Plain make is enough when SDL2 is
 installed normally and sdl2-config is in path :
 
+```
 sh
 make                 # -> build/coab
 make test            # headless self-test, writes PPMs, needs no display
@@ -48,14 +47,16 @@ sh
 ./configure --with-sdl-prefix=/opt/sdl2
 ./configure --help                     # all options
 make && make test && make install
-
+```
 CMake, for the same reasons:
 
+```
 sh
 cmake -B build-cmake -DSDL2_PREFIX=/opt/sdl2
 cmake --build build-cmake
 ctest --test-dir build-cmake --output-on-failure
 cmake --install build-cmake --prefix /usr/local
+```
 
 Use `build-cmake`, not `build`: the latter is where the Makefile puts its object
 files.
