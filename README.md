@@ -42,25 +42,21 @@ make test            # headless self-test, writes PPMs, needs no display
 make info            # show the detected SDL flags
 ./build/coab --data ../Data
 
-'./configure' when SDL2 is somewhere unusual, or to pin down install paths:
+./configure' when SDL2 is somewhere unusual, or to pin down install paths:
 
-sh
 ./configure --with-sdl-prefix=/opt/sdl2
 ./configure --help                     # all options
 make && make test && make install
 ```
-CMake, for the same reasons:
+CMake :
 
 ```
-sh
-cmake -B build-cmake -DSDL2_PREFIX=/opt/sdl2
-cmake --build build-cmake
-ctest --test-dir build-cmake --output-on-failure
-cmake --install build-cmake --prefix /usr/local
+mkdir build
+cd build
+cmake ..
+make 
 ```
 
-Use `build-cmake`, not `build`: the latter is where the Makefile puts its object
-files.
 
 ### Finding SDL2 in a non-standard place
 
@@ -108,5 +104,6 @@ the way `,` and `.` do — which is the one change it makes to what a player see
 (see *Notes on the port*). In the dungeon and in a fight the arrows have always
 worked: up walks forward, down turns about, left and right turn, and on the combat
 map the keypad's corners are the diagonals.
+
 
 
