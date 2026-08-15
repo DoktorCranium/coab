@@ -17,6 +17,7 @@ OpenVMS
 ## Build amd run
 
 Make sure you have SDL-1.2 installed and setup
+HP C V7.3-009 on OpenVMS Alpha V8.4   
 
 ```
 @configure.com 
