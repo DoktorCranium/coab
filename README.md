@@ -20,7 +20,7 @@ Make sure you have SDL-1.2 installed and setup
 
 @configure.com 
 @build 
-coab :== $DISK:[PATH]COAB.EXE  
+coab :== $DISK:[PATH]COAB.EXE 
 coab --scale 2 
 
 
