@@ -1,0 +1,24 @@
+
+=== checking for a C compiler
+
+$ cc -o /var/folders/c4/_c99khtx7xs1k76hz898mk840000gn/T/tmp.qryNDRQCJK/conf /var/folders/c4/_c99khtx7xs1k76hz898mk840000gn/T/tmp.qryNDRQCJK/conf.c
+
+=== checking whether cc accepts -std=c99
+
+$ cc -std=c99 -o /var/folders/c4/_c99khtx7xs1k76hz898mk840000gn/T/tmp.qryNDRQCJK/conf /var/folders/c4/_c99khtx7xs1k76hz898mk840000gn/T/tmp.qryNDRQCJK/conf.c
+
+=== checking for SDL2
+
+--- candidate: pkg-config
+    cflags: -D_THREAD_SAFE -I/usr/local/include -I/usr/local/include/SDL2
+    libs:   -L/usr/local/lib -lSDL2
+
+$ cc -std=c99 -D_THREAD_SAFE -I/usr/local/include -I/usr/local/include/SDL2 -o /var/folders/c4/_c99khtx7xs1k76hz898mk840000gn/T/tmp.qryNDRQCJK/sdltest /var/folders/c4/_c99khtx7xs1k76hz898mk840000gn/T/tmp.qryNDRQCJK/sdltest.c -L/usr/local/lib -lSDL2
+
+=== checking whether cc accepts -Wl,-rpath
+
+$ cc -std=c99 -o /var/folders/c4/_c99khtx7xs1k76hz898mk840000gn/T/tmp.qryNDRQCJK/conf /var/folders/c4/_c99khtx7xs1k76hz898mk840000gn/T/tmp.qryNDRQCJK/conf.c -Wl,-rpath,/usr/local/lib
+
+=== checking SDL2 version
+
+$ cc -std=c99 -D_THREAD_SAFE -I/usr/local/include -I/usr/local/include/SDL2 -o /var/folders/c4/_c99khtx7xs1k76hz898mk840000gn/T/tmp.qryNDRQCJK/sdlver /var/folders/c4/_c99khtx7xs1k76hz898mk840000gn/T/tmp.qryNDRQCJK/sdltest.c -L/usr/local/lib -lSDL2 -Wl,-rpath,/usr/local/lib

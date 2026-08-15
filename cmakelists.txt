@@ -1,0 +1,475 @@
+# Curse of the Azure Bonds - C/SDL port
+#
+#   cmake -B build-cmake && cmake --build build-cmake
+#   ctest --test-dir build-cmake --output-on-failure   # headless self-test
+#   cmake --install build-cmake --prefix /usr/local
+#
+# Not "build": that is where the Makefile puts its object files, and the two
+# would tread on each other.
+#
+# SDL2 is the default. -DCOAB_SDL1=ON selects the SDL-1.2 backend instead, which
+# has no sound; both live in src/ and platform.h picks between them, so this is
+# only a matter of which macro is defined. For OpenVMS use DESCRIP.MMS rather
+# than cmake; see PORTING-VMS.md.
+#
+# When SDL is not in a standard place, any one of these works:
+#
+#   cmake -B build-cmake -DSDL2_PREFIX=/opt/sdl2
+#   cmake -B build-cmake -DSDL2_INCLUDE_DIR=/opt/sdl2/include/SDL2 \
+#                        -DSDL2_LIBRARY=/opt/sdl2/lib/libSDL2.so
+#   cmake -B build-cmake -DCOAB_SDL1=ON -DSDL_PREFIX=/opt/sdl12
+#
+# A prefix named here is used strictly: if SDL is not usable under it the
+# configure step fails rather than falling back to a system-wide copy.
+#
+# SDL2 is looked for three ways, in decreasing order of trustworthiness: its own
+# CMake package, then pkg-config, then the header and library on their own. The
+# last route exists because plenty of hand-built SDL2 trees ship neither
+# SDL2Config.cmake nor sdl2.pc. SDL-1.2 has no CMake package at all, so that
+# search starts at sdl-config instead.
+
+cmake_minimum_required(VERSION 3.16)
+
+project(coab
+        VERSION 0.1.0
+        DESCRIPTION "Curse of the Azure Bonds - C/SDL port"
+        LANGUAGES C)
+
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
+
+if(CMAKE_BINARY_DIR STREQUAL CMAKE_SOURCE_DIR)
+  message(FATAL_ERROR
+    "Configure into a separate directory, or CMake's generated files land on "
+    "top of the hand-written Makefile:\n  cmake -B build-cmake\n")
+endif()
+
+# The Makefile compiles into build/. Sharing it would mean two build systems
+# writing to one directory.
+if(CMAKE_BINARY_DIR STREQUAL "${CMAKE_SOURCE_DIR}/build")
+  message(WARNING
+    "build/ is where the Makefile puts its object files; build-cmake/ avoids "
+    "the two build systems overwriting each other.")
+endif()
+
+option(COAB_ENABLE_SANITIZERS "Build with AddressSanitizer and UBSan" OFF)
+option(COAB_WERROR            "Treat warnings as errors"              OFF)
+option(COAB_SDL1              "Build against SDL-1.2 instead of SDL2 (no sound)" OFF)
+set(SDL2_PREFIX  "" CACHE PATH   "Directory SDL2 was installed under")
+set(SDL_PREFIX   "" CACHE PATH   "Directory SDL-1.2 was installed under (with COAB_SDL1)")
+set(COAB_DATA_DIR "" CACHE PATH  "Fallback location of the .DAX files, compiled in")
+
+if(COAB_SDL1)
+  set(_coab_backend "SDL-1.2")
+  set(_coab_backend_def COAB_SDL1=1)
+else()
+  set(_coab_backend "SDL2")
+  set(_coab_backend_def COAB_SDL2=1)
+endif()
+
+# --------------------------------------------------------------- find SDL
+
+set(_sdl_route "")
+set(_sdl_link "")
+set(_sdl_include "")
+set(_sdl_cflags "")
+
+# True when PATH lies inside SDL2_PREFIX. Used to reject a hit that came from
+# somewhere else: find_package and find_library will happily return a
+# system-wide SDL2, and building against that after a prefix was named would
+# only surface later as a puzzling run-time mismatch.
+function(_coab_under_prefix out path)
+  set(${out} FALSE PARENT_SCOPE)
+  if(path AND SDL2_PREFIX)
+    get_filename_component(_real "${path}" REALPATH)
+    get_filename_component(_root "${SDL2_PREFIX}" REALPATH)
+    string(FIND "${_real}" "${_root}" _pos)
+    if(_pos EQUAL 0)
+      set(${out} TRUE PARENT_SCOPE)
+    endif()
+  endif()
+endfunction()
+
+# Fills _sdl_* from whichever of SDL2's CMake package targets exists.
+macro(_coab_take_sdl2_package)
+  if(TARGET SDL2::SDL2)
+    set(_sdl_link SDL2::SDL2)
+  elseif(TARGET SDL2::SDL2-static)
+    set(_sdl_link SDL2::SDL2-static)
+  else()
+    # Very old SDL2Config.cmake files only set variables.
+    set(_sdl_link "${SDL2_LIBRARIES}")
+    set(_sdl_include "${SDL2_INCLUDE_DIRS}")
+  endif()
+  set(_sdl_route "CMake package (SDL2_DIR=${SDL2_DIR})")
+endmacro()
+
+macro(_coab_take_pkgconfig)
+  set(_sdl_link    "${PC_SDL2_LINK_LIBRARIES}")
+  set(_sdl_include "${PC_SDL2_INCLUDE_DIRS}")
+  set(_sdl_cflags  "${PC_SDL2_CFLAGS_OTHER}")
+  set(_sdl_route   "pkg-config (${PC_SDL2_VERSION})")
+endmacro()
+
+macro(_coab_take_library _lib _inc _desc)
+  set(_sdl_link    "${_lib}")
+  set(_sdl_include "${_inc}")
+  set(_sdl_route   "${_desc}")
+  find_package(Threads QUIET)
+  if(Threads_FOUND)
+    list(APPEND _sdl_link Threads::Threads)
+  endif()
+endmacro()
+
+# Asks an sdl-config or sdl2-config script for its flags. Kept for SDL-1.2,
+# where a hand-built tree very often ships the script and nothing else: SDL 1.2
+# predates pkg-config being universal and has no CMake package at all.
+macro(_coab_take_sdl_config _script _desc)
+  execute_process(COMMAND "${_script}" --cflags
+                  OUTPUT_VARIABLE _cfg_cflags OUTPUT_STRIP_TRAILING_WHITESPACE
+                  ERROR_QUIET RESULT_VARIABLE _cfg_rc1)
+  execute_process(COMMAND "${_script}" --libs
+                  OUTPUT_VARIABLE _cfg_libs OUTPUT_STRIP_TRAILING_WHITESPACE
+                  ERROR_QUIET RESULT_VARIABLE _cfg_rc2)
+  if(_cfg_rc1 EQUAL 0 AND _cfg_rc2 EQUAL 0 AND _cfg_cflags AND _cfg_libs)
+    separate_arguments(_cfg_cflags UNIX_COMMAND "${_cfg_cflags}")
+    separate_arguments(_cfg_libs   UNIX_COMMAND "${_cfg_libs}")
+    # -I flags belong on the include path, not in the compile options, or CMake
+    # will not track them as dependencies.
+    set(_sdl_cflags "")
+    foreach(_f ${_cfg_cflags})
+      if(_f MATCHES "^-I(.+)$")
+        list(APPEND _sdl_include "${CMAKE_MATCH_1}")
+      else()
+        list(APPEND _sdl_cflags "${_f}")
+      endif()
+    endforeach()
+    set(_sdl_link  "${_cfg_libs}")
+    set(_sdl_route "${_desc}")
+  endif()
+endmacro()
+
+find_package(PkgConfig QUIET)
+
+# SDL-1.2, when it was asked for. Deliberately simpler than the SDL2 search
+# below: there is no SDL1Config.cmake to look for, and any SDL whose headers and
+# library are found together is the one to use - sdl12-compat included, since it
+# implements the same 1.2 API this backend is written to.
+if(COAB_SDL1)
+  if(SDL_PREFIX AND NOT IS_DIRECTORY "${SDL_PREFIX}")
+    message(FATAL_ERROR "SDL_PREFIX is not a directory: ${SDL_PREFIX}")
+  endif()
+
+  # 0. Both paths named outright.
+  if(SDL_INCLUDE_DIR AND SDL_LIBRARY)
+    _coab_take_library("${SDL_LIBRARY}" "${SDL_INCLUDE_DIR}"
+                       "SDL_INCLUDE_DIR and SDL_LIBRARY as given")
+  endif()
+
+  # 1. The sdl-config script, under a named prefix or on PATH.
+  if(NOT _sdl_route)
+    if(SDL_PREFIX)
+      find_program(SDL_CONFIG NAMES sdl-config sdl11-config
+                   PATHS "${SDL_PREFIX}" PATH_SUFFIXES bin NO_DEFAULT_PATH)
+    else()
+      find_program(SDL_CONFIG NAMES sdl-config sdl11-config)
+    endif()
+    if(SDL_CONFIG)
+      _coab_take_sdl_config("${SDL_CONFIG}" "sdl-config (${SDL_CONFIG})")
+    endif()
+  endif()
+
+  # 2. pkg-config. SDL 1.2's own .pc is named sdl; sdl12-compat ships sdl12_compat.
+  if(NOT _sdl_route AND PKG_CONFIG_FOUND)
+    if(SDL_PREFIX)
+      set(_pc_dirs "")
+      foreach(_d lib/pkgconfig lib64/pkgconfig share/pkgconfig)
+        if(IS_DIRECTORY "${SDL_PREFIX}/${_d}")
+          list(APPEND _pc_dirs "${SDL_PREFIX}/${_d}")
+        endif()
+      endforeach()
+      if(_pc_dirs)
+        string(JOIN ":" _pc_path ${_pc_dirs})
+        set(_saved_pc_path "$ENV{PKG_CONFIG_PATH}")
+        set(_saved_pc_libdir "$ENV{PKG_CONFIG_LIBDIR}")
+        set(ENV{PKG_CONFIG_PATH} "${_pc_path}")
+        set(ENV{PKG_CONFIG_LIBDIR} "${_pc_path}")
+        pkg_check_modules(PC_SDL QUIET sdl sdl12_compat)
+        set(ENV{PKG_CONFIG_PATH} "${_saved_pc_path}")
+        set(ENV{PKG_CONFIG_LIBDIR} "${_saved_pc_libdir}")
+      endif()
+    else()
+      pkg_check_modules(PC_SDL QUIET sdl sdl12_compat)
+    endif()
+    if(PC_SDL_FOUND)
+      set(_sdl_link    "${PC_SDL_LINK_LIBRARIES}")
+      set(_sdl_include "${PC_SDL_INCLUDE_DIRS}")
+      set(_sdl_cflags  "${PC_SDL_CFLAGS_OTHER}")
+      set(_sdl_route   "pkg-config (${PC_SDL_VERSION})")
+    endif()
+  endif()
+
+  # 3. The header and the library on their own.
+  if(NOT _sdl_route)
+    if(SDL_PREFIX)
+      find_path(SDL_INCLUDE_DIR NAMES SDL.h PATHS "${SDL_PREFIX}"
+                PATH_SUFFIXES include/SDL include NO_DEFAULT_PATH)
+      find_library(SDL_LIBRARY NAMES SDL SDL-1.2 PATHS "${SDL_PREFIX}"
+                   PATH_SUFFIXES lib lib64 NO_DEFAULT_PATH)
+    else()
+      find_path(SDL_INCLUDE_DIR NAMES SDL.h HINTS ENV SDLDIR
+                PATH_SUFFIXES include/SDL include SDL
+                PATHS /usr/pkg /usr/local /opt/local)
+      find_library(SDL_LIBRARY NAMES SDL SDL-1.2 HINTS ENV SDLDIR
+                   PATH_SUFFIXES lib lib64
+                   PATHS /usr/pkg /usr/local /opt/local)
+    endif()
+    if(SDL_INCLUDE_DIR AND SDL_LIBRARY)
+      _coab_take_library("${SDL_LIBRARY}" "${SDL_INCLUDE_DIR}"
+                         "header and library (${SDL_LIBRARY})")
+    endif()
+  endif()
+
+  if(NOT _sdl_route)
+    message(FATAL_ERROR
+      "Could not find SDL-1.2 (COAB_SDL1=ON).\n"
+      "Install the SDL 1.2 development package (libsdl1.2-dev on Debian and "
+      "Ubuntu, SDL-devel on Fedora, sdl12-compat on Arch, SDL from pkgsrc), or "
+      "point cmake at an existing copy:\n"
+      "  cmake -B build -DCOAB_SDL1=ON -DSDL_PREFIX=/where/sdl12/lives\n"
+      "  cmake -B build -DCOAB_SDL1=ON -DSDL_INCLUDE_DIR=... -DSDL_LIBRARY=...\n")
+  endif()
+
+  # Very old SDL 1.2 header sets leave DECLSPEC undefined outside Windows and
+  # VMS, and then every prototype in SDL_error.h begins with an unknown
+  # identifier. Harmless to define when the header already handles it, and it
+  # turns an unreadable failure into a working build. See PORTING-VMS.md.
+  # No SDL function is called, so this needs no library on the link line and can
+  # only fail for a header reason. Calling SDL_Init here would make a missing or
+  # mismatched library look like the DECLSPEC problem instead.
+  include(CheckCSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES "${_sdl_include}")
+  # CMAKE_REQUIRED_FLAGS is a space-separated string, not a list; passing
+  # _sdl_cflags straight through would hand cmake "-D_GNU_SOURCE=1;-D_REENTRANT".
+  string(JOIN " " CMAKE_REQUIRED_FLAGS ${_sdl_cflags})
+  check_c_source_compiles(
+    "#include <SDL.h>\nint main(void){return (int)sizeof(SDL_Surface) > 0;}"
+    COAB_SDL1_HEADER_OK)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  unset(CMAKE_REQUIRED_FLAGS)
+  if(NOT COAB_SDL1_HEADER_OK)
+    list(APPEND _sdl_cflags "-DDECLSPEC=")
+  endif()
+
+# 0. Both paths named outright: the escape hatch for an install too unusual to
+#    guess at, so it is honoured before anything is searched for.
+elseif(SDL2_INCLUDE_DIR AND SDL2_LIBRARY)
+  _coab_take_library("${SDL2_LIBRARY}" "${SDL2_INCLUDE_DIR}"
+                     "SDL2_INCLUDE_DIR and SDL2_LIBRARY as given")
+
+# 1. A named prefix restricts the search to that prefix and fails if SDL2 is not
+#    usable there, rather than quietly building against a different copy.
+elseif(SDL2_PREFIX)
+  if(NOT IS_DIRECTORY "${SDL2_PREFIX}")
+    message(FATAL_ERROR "SDL2_PREFIX is not a directory: ${SDL2_PREFIX}")
+  endif()
+
+  find_package(SDL2 CONFIG QUIET PATHS "${SDL2_PREFIX}" NO_DEFAULT_PATH)
+  if(SDL2_FOUND)
+    _coab_under_prefix(_ok "${SDL2_DIR}")
+    if(_ok)
+      _coab_take_sdl2_package()
+    endif()
+  endif()
+
+  if(NOT _sdl_route AND PKG_CONFIG_FOUND)
+    # PKG_CONFIG_LIBDIR, not just PKG_CONFIG_PATH: the former replaces the
+    # default directories instead of being searched after them, so a
+    # system-wide sdl2.pc cannot answer for a prefix that lacks one.
+    set(_pc_dirs "")
+    foreach(_d lib/pkgconfig lib64/pkgconfig share/pkgconfig)
+      if(IS_DIRECTORY "${SDL2_PREFIX}/${_d}")
+        list(APPEND _pc_dirs "${SDL2_PREFIX}/${_d}")
+      endif()
+    endforeach()
+    if(_pc_dirs)
+      string(JOIN ":" _pc_path ${_pc_dirs})
+      set(_saved_pc_path "$ENV{PKG_CONFIG_PATH}")
+      set(_saved_pc_libdir "$ENV{PKG_CONFIG_LIBDIR}")
+      set(ENV{PKG_CONFIG_PATH} "${_pc_path}")
+      set(ENV{PKG_CONFIG_LIBDIR} "${_pc_path}")
+
+      pkg_check_modules(PC_SDL2 QUIET sdl2)
+      if(PC_SDL2_FOUND)
+        _coab_take_pkgconfig()
+      endif()
+
+      set(ENV{PKG_CONFIG_PATH} "${_saved_pc_path}")
+      set(ENV{PKG_CONFIG_LIBDIR} "${_saved_pc_libdir}")
+    endif()
+  endif()
+
+  if(NOT _sdl_route)
+    find_path(SDL2_INCLUDE_DIR NAMES SDL.h
+              PATHS "${SDL2_PREFIX}"
+              PATH_SUFFIXES include/SDL2 include
+              NO_DEFAULT_PATH)
+    find_library(SDL2_LIBRARY NAMES SDL2 SDL2-2.0
+                 PATHS "${SDL2_PREFIX}"
+                 PATH_SUFFIXES lib lib64
+                 NO_DEFAULT_PATH)
+    if(SDL2_INCLUDE_DIR AND SDL2_LIBRARY)
+      _coab_take_library("${SDL2_LIBRARY}" "${SDL2_INCLUDE_DIR}"
+                         "header and library under ${SDL2_PREFIX}")
+    endif()
+  endif()
+
+  if(NOT _sdl_route)
+    message(FATAL_ERROR
+      "No usable SDL2 under SDL2_PREFIX=${SDL2_PREFIX}.\n"
+      "Looked for:\n"
+      "  ${SDL2_PREFIX}/lib/cmake/SDL2/SDL2Config.cmake\n"
+      "  ${SDL2_PREFIX}/lib/pkgconfig/sdl2.pc  (and lib64, share)\n"
+      "  ${SDL2_PREFIX}/include/SDL2/SDL.h with ${SDL2_PREFIX}/lib/libSDL2\n"
+      "If the headers and the library live under different roots, name both:\n"
+      "  cmake -B build -DSDL2_INCLUDE_DIR=/a/include/SDL2 "
+      "-DSDL2_LIBRARY=/b/lib/libSDL2.so\n")
+  endif()
+
+# 2. Nothing specific was asked for: the usual routes, widest last.
+else()
+  find_package(SDL2 CONFIG QUIET)
+  if(SDL2_FOUND)
+    _coab_take_sdl2_package()
+  endif()
+
+  if(NOT _sdl_route AND PKG_CONFIG_FOUND)
+    pkg_check_modules(PC_SDL2 QUIET sdl2)
+    if(PC_SDL2_FOUND)
+      _coab_take_pkgconfig()
+    endif()
+  endif()
+
+  if(NOT _sdl_route)
+    find_path(SDL2_INCLUDE_DIR NAMES SDL.h
+              HINTS ENV SDL2DIR
+              PATH_SUFFIXES include/SDL2 include SDL2
+              PATHS /usr/pkg /usr/local /opt/sdl2 /opt/local)
+    find_library(SDL2_LIBRARY NAMES SDL2 SDL2-2.0
+                 HINTS ENV SDL2DIR
+                 PATH_SUFFIXES lib lib64
+                 PATHS /usr/pkg /usr/local /opt/sdl2 /opt/local)
+    if(SDL2_INCLUDE_DIR AND SDL2_LIBRARY)
+      _coab_take_library("${SDL2_LIBRARY}" "${SDL2_INCLUDE_DIR}"
+                         "header and library (${SDL2_LIBRARY})")
+    endif()
+  endif()
+
+  if(NOT _sdl_route)
+    message(FATAL_ERROR
+      "Could not find SDL2.\n"
+      "Install the SDL2 development package (libsdl2-dev on Debian and Ubuntu, "
+      "SDL2-devel on Fedora, sdl2 on Arch), or point cmake at an existing copy:\n"
+      "  cmake -B build -DSDL2_PREFIX=/where/sdl2/lives\n"
+      "  cmake -B build -DSDL2_INCLUDE_DIR=... -DSDL2_LIBRARY=...\n")
+  endif()
+endif()
+
+# ------------------------------------------------------------------ the binary
+
+file(GLOB COAB_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c")
+if(NOT COAB_SOURCES)
+  message(FATAL_ERROR "No sources found in ${CMAKE_CURRENT_SOURCE_DIR}/src")
+endif()
+
+add_executable(coab ${COAB_SOURCES})
+
+target_include_directories(coab PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_compile_definitions(coab PRIVATE ${_coab_backend_def} _DEFAULT_SOURCE)
+target_link_libraries(coab PRIVATE ${_sdl_link})
+
+if(_sdl_include)
+  target_include_directories(coab PRIVATE ${_sdl_include})
+endif()
+if(_sdl_cflags)
+  target_compile_options(coab PRIVATE ${_sdl_cflags})
+endif()
+
+if(COAB_DATA_DIR)
+  target_compile_definitions(coab PRIVATE COAB_DATA_DIR="${COAB_DATA_DIR}")
+endif()
+
+# libm is separate on glibc and absent elsewhere.
+include(CheckLibraryExists)
+check_library_exists(m sqrt "" HAVE_LIBM)
+if(HAVE_LIBM)
+  target_link_libraries(coab PRIVATE m)
+endif()
+
+# Same warning set the Makefile uses.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+  target_compile_options(coab PRIVATE
+    -Wall -Wextra -Wno-unused-parameter -Wshadow
+    -Wstrict-prototypes -Wmissing-prototypes -Wpointer-arith -Wwrite-strings)
+  if(COAB_WERROR)
+    target_compile_options(coab PRIVATE -Werror)
+  endif()
+  if(COAB_ENABLE_SANITIZERS)
+    target_compile_options(coab PRIVATE
+      -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(coab PRIVATE -fsanitize=address,undefined)
+  endif()
+endif()
+
+# An SDL outside the loader's default path has to be recorded in the binary, or
+# it links against the SDL configured here and loads a different one at run
+# time. CMake does this for imported targets; a bare library path needs help.
+set_target_properties(coab PROPERTIES
+  BUILD_WITH_INSTALL_RPATH FALSE
+  INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+if(COAB_SDL1)
+  set(_sdl_libpath "${SDL_LIBRARY}")
+else()
+  set(_sdl_libpath "${SDL2_LIBRARY}")
+endif()
+if(_sdl_libpath)
+  get_filename_component(_sdl_libdir "${_sdl_libpath}" DIRECTORY)
+  set_property(TARGET coab APPEND PROPERTY BUILD_RPATH "${_sdl_libdir}")
+endif()
+
+# ------------------------------------------------------------------- test
+
+enable_testing()
+
+# Renders offscreen and writes PPMs, so it passes on a machine with no display.
+add_test(NAME selftest
+         COMMAND coab --self-test --out "${CMAKE_CURRENT_BINARY_DIR}/selftest-out")
+set_tests_properties(selftest PROPERTIES
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  FAIL_REGULAR_EXPRESSION "FAIL")
+
+# ------------------------------------------------------------------ install
+
+include(GNUInstallDirs)
+install(TARGETS coab RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES README.md DESTINATION ${CMAKE_INSTALL_DOCDIR})
+
+# ------------------------------------------------------------------ summary
+
+message(STATUS "coab: ${_coab_backend} via ${_sdl_route}")
+if(COAB_SDL1)
+  message(STATUS "coab: no sound - the SDL-1.2 backend has no audio path")
+endif()
+message(STATUS "coab: build type ${CMAKE_BUILD_TYPE}")
+if(COAB_DATA_DIR)
+  message(STATUS "coab: game data compiled in as ${COAB_DATA_DIR}")
+else()
+  message(STATUS "coab: game data located at run time "
+                 "(-DCOAB_DATA_DIR=... to compile one in)")
+endif()

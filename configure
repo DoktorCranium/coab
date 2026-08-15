@@ -1,0 +1,567 @@
+#!/bin/sh
+# configure - locate SDL and a working compiler, then write config.mk.
+#
+# Hand-written POSIX shell rather than autoconf: this is a single directory of
+# C files, and a script that can be read in one sitting is worth more here than
+# a generated one. It does the part that matters, though - every candidate set
+# of SDL flags is verified by actually compiling and linking against it, so a
+# successful configure means make will work rather than merely that some header
+# was found.
+#
+# The Makefile works without this script; configure exists so an SDL in an
+# unusual place can be named once instead of on every make invocation.
+#
+# SDL2 is the default. --with-sdl1 selects the SDL-1.2 backend instead, which is
+# what OpenVMS and other systems with no SDL2 need; that backend has no sound.
+
+set -e
+
+# ------------------------------------------------------------------- defaults
+
+prefix=/usr/local
+exec_prefix=
+bindir=
+datarootdir=
+sdl_prefix=
+sdl_config=
+sdl_api=2
+pkg_config=${PKG_CONFIG:-pkg-config}
+game_data=
+enable_debug=no
+enable_sanitizers=no
+enable_rpath=auto
+CC=${CC:-}
+CFLAGS=${CFLAGS:-}
+LDFLAGS=${LDFLAGS:-}
+
+# Places a hand-built or packaged SDL commonly ends up in, searched after the
+# compiler's own defaults and only when nothing more specific was given.
+extra_prefixes="/usr/pkg /usr/local /opt/sdl2 /opt/sdl /opt/local $HOME/.local"
+
+usage() {
+    cat <<'EOF'
+usage: ./configure [options]
+
+Installation directories:
+  --prefix=DIR            install under DIR              [/usr/local]
+  --exec-prefix=DIR       architecture-dependent files   [PREFIX]
+  --bindir=DIR            the executable                 [EPREFIX/bin]
+  --datarootdir=DIR       read-only data                 [PREFIX/share]
+
+Which SDL to build against:
+  --with-sdl2             SDL2, with sound                 [default]
+  --with-sdl1             SDL-1.2, without sound; for systems with no SDL2
+
+Finding SDL when it is not in a standard place:
+  --with-sdl-prefix=DIR   SDL was installed under DIR; DIR/bin/sdl*-config,
+                          DIR/lib/pkgconfig and DIR/include are used
+  --with-sdl-config=PATH  use this sdl2-config (or sdl-config) script
+  --with-pkg-config=PATH  use this pkg-config              [pkg-config]
+  --enable-rpath          record the SDL library path in the binary
+  --disable-rpath         do not, even if the path is non-standard  [auto]
+
+Game data:
+  --with-game-data=DIR    compile in DIR as the fallback location of the .DAX
+                          files, so an installed copy needs no --data argument
+
+Build type:
+  --enable-debug          -O0 -g3, assertions on
+  --enable-sanitizers     build with AddressSanitizer and UBSan
+
+Environment variables honoured: CC, CFLAGS, LDFLAGS, PKG_CONFIG,
+PKG_CONFIG_PATH.
+
+Examples:
+  ./configure --with-sdl-prefix=/opt/sdl2
+  ./configure --with-sdl-config=/usr/pkg/bin/sdl2-config --enable-debug
+  ./configure --with-sdl1 --with-sdl-prefix=/opt/sdl12
+  PKG_CONFIG_PATH=/opt/sdl2/lib/pkgconfig ./configure
+EOF
+}
+
+# ---------------------------------------------------------------- arg parsing
+
+for arg do
+    case $arg in
+    --help|-h)              usage; exit 0 ;;
+    --prefix=*)             prefix=${arg#*=} ;;
+    --exec-prefix=*)        exec_prefix=${arg#*=} ;;
+    --bindir=*)             bindir=${arg#*=} ;;
+    --datarootdir=*)        datarootdir=${arg#*=} ;;
+    --with-sdl1|--enable-sdl1)  sdl_api=1 ;;
+    --with-sdl2|--enable-sdl2)  sdl_api=2 ;;
+    --with-sdl-prefix=*)    sdl_prefix=${arg#*=} ;;
+    --with-sdl-config=*)    sdl_config=${arg#*=} ;;
+    --with-pkg-config=*)    pkg_config=${arg#*=} ;;
+    --with-game-data=*)     game_data=${arg#*=} ;;
+    --enable-debug)         enable_debug=yes ;;
+    --disable-debug)        enable_debug=no ;;
+    --enable-sanitizers)    enable_sanitizers=yes ;;
+    --disable-sanitizers)   enable_sanitizers=no ;;
+    --enable-rpath)         enable_rpath=yes ;;
+    --disable-rpath)        enable_rpath=no ;;
+    CC=*)                   CC=${arg#*=} ;;
+    CFLAGS=*)               CFLAGS=${arg#*=} ;;
+    LDFLAGS=*)              LDFLAGS=${arg#*=} ;;
+    # Accepted and ignored: these get passed by distribution build scripts that
+    # assume autoconf, and erroring out on them is unhelpful.
+    --host=*|--build=*|--target=*|--sbindir=*|--libdir=*|--includedir=*) ;;
+    --libexecdir=*|--sysconfdir=*|--localstatedir=*|--sharedstatedir=*) ;;
+    --mandir=*|--infodir=*|--docdir=*|--localedir=*|--runstatedir=*) ;;
+    --disable-option-checking|--disable-dependency-tracking|--enable-silent-rules) ;;
+    *) echo "configure: unrecognised option: $arg" >&2
+       echo "try ./configure --help" >&2
+       exit 1 ;;
+    esac
+done
+
+test -n "$exec_prefix" || exec_prefix=$prefix
+test -n "$bindir"      || bindir=$exec_prefix/bin
+test -n "$datarootdir" || datarootdir=$prefix/share
+
+# Everything that differs between the two SDL major versions, named once here so
+# the probe below reads the same either way.
+if [ $sdl_api = 1 ]; then
+    sdl_label="SDL-1.2"
+    sdl_pc=sdl
+    sdl_config_name=sdl-config
+    sdl_incdirs="include/SDL include"
+    sdl_lib=-lSDL
+    sdl_def=-DCOAB_SDL1=1
+    sdl_devpkg="libsdl1.2-dev on Debian and Ubuntu, SDL-devel on Fedora,
+sdl12-compat on Arch, SDL from pkgsrc, sdl12-compat from Homebrew"
+else
+    sdl_label="SDL2"
+    sdl_pc=sdl2
+    sdl_config_name=sdl2-config
+    sdl_incdirs="include/SDL2 include"
+    sdl_lib=-lSDL2
+    sdl_def=-DCOAB_SDL2=1
+    sdl_devpkg="libsdl2-dev on Debian and Ubuntu, SDL2-devel on Fedora,
+sdl2 on Arch, sdl2 from pkgsrc or Homebrew"
+fi
+
+srcdir=$(dirname "$0")
+case $srcdir in .|"") srcdir=. ;; esac
+
+if [ ! -f "$srcdir/src/main.c" ]; then
+    echo "configure: cannot find src/main.c next to this script" >&2
+    exit 1
+fi
+
+# --------------------------------------------------------------- small helpers
+
+tmpdir=
+cleanup() { test -n "$tmpdir" && rm -rf "$tmpdir"; }
+trap cleanup EXIT HUP INT TERM
+
+tmpdir=$(mktemp -d 2>/dev/null || { d=./conf-tmp.$$; mkdir "$d" && echo "$d"; })
+
+log=config.log
+: > $log
+
+say()   { printf '%s' "$*"; }
+sayln() { printf '%s\n' "$*"; }
+
+# Runs a command with output going only to config.log.
+try() {
+    {
+        printf '\n$ %s\n' "$*"
+        "$@" 2>&1
+    } >> $log
+}
+
+checking() { say "checking $1... "; printf '\n=== checking %s\n' "$1" >> $log; }
+
+die() {
+    sayln "no"
+    sayln ""
+    sayln "configure: error: $1"
+    test -n "$2" && { sayln ""; sayln "$2"; }
+    sayln ""
+    sayln "See config.log for the commands that were tried."
+    exit 1
+}
+
+# ------------------------------------------------------------------- compiler
+
+checking "for a C compiler"
+cat > "$tmpdir/conf.c" <<'EOF'
+int main(void) { return 0; }
+EOF
+
+found_cc=
+for cc in ${CC:-cc gcc clang tcc}; do
+    if try $cc -o "$tmpdir/conf" "$tmpdir/conf.c"; then
+        found_cc=$cc
+        break
+    fi
+done
+test -n "$found_cc" || die "no working C compiler found" \
+    "Install a compiler (build-essential, gcc, or clang) or set CC."
+CC=$found_cc
+sayln "$CC"
+
+checking "whether $CC accepts -std=c99"
+if try $CC -std=c99 -o "$tmpdir/conf" "$tmpdir/conf.c"; then
+    std=-std=c99
+    sayln "yes"
+else
+    std=
+    sayln "no (building without it)"
+fi
+
+# ------------------------------------------------------------------ SDL probe
+#
+# Candidates are tried in order of how specific they are, and each is only
+# accepted if a program using it compiles and links.
+
+sdl_ok=no
+sdl_cflags=
+sdl_libs=
+sdl_how=
+
+if [ $sdl_api = 1 ]; then
+cat > "$tmpdir/sdltest.c" <<'EOF'
+#include <SDL.h>
+#include <stdio.h>
+int main(void)
+{
+    /* the library that actually got linked, not the headers */
+    const SDL_version *v = SDL_Linked_Version();
+    printf("%d.%d.%d\n", v->major, v->minor, v->patch);
+    return v->major == 1 ? 0 : 1;
+}
+EOF
+else
+cat > "$tmpdir/sdltest.c" <<'EOF'
+#include <SDL.h>
+#include <stdio.h>
+int main(void)
+{
+    SDL_version v;
+    SDL_GetVersion(&v);          /* the library that actually got linked */
+    printf("%d.%d.%d\n", v.major, v.minor, v.patch);
+    return v.major == 2 ? 0 : 1;
+}
+EOF
+fi
+
+# Accepts a candidate set of flags if it compiles and links.
+sdl_try() {
+    _how=$1; _cf=$2; _lb=$3
+    test -n "$_cf$_lb" || return 1
+    printf '\n--- candidate: %s\n    cflags: %s\n    libs:   %s\n' \
+        "$_how" "$_cf" "$_lb" >> $log
+    # User CFLAGS and LDFLAGS take part in the probe, so naming an SDL2 through
+    # them works as well as --with-sdl-prefix does.
+    # shellcheck disable=SC2086
+    if try $CC $std $CFLAGS $_cf -o "$tmpdir/sdltest" "$tmpdir/sdltest.c" \
+            $LDFLAGS $_lb; then
+        sdl_cflags=$_cf
+        sdl_libs=$_lb
+        sdl_how=$_how
+        sdl_ok=yes
+        return 0
+    fi
+    # Old SDL 1.2 header sets define DECLSPEC only for Windows and VMS and have
+    # no #else, so every prototype in SDL_error.h begins with an unknown
+    # identifier and nothing at all compiles. Retried rather than assumed: the
+    # flag is harmless where the header handles DECLSPEC itself, but adding it
+    # unasked would hide a real header problem behind a working-looking build.
+    if [ $sdl_api = 1 ]; then
+        printf '    retrying with -DDECLSPEC=\n' >> $log
+        # shellcheck disable=SC2086
+        if try $CC $std $CFLAGS -DDECLSPEC= $_cf \
+                -o "$tmpdir/sdltest" "$tmpdir/sdltest.c" $LDFLAGS $_lb; then
+            sdl_cflags="-DDECLSPEC= $_cf"
+            sdl_libs=$_lb
+            sdl_how="$_how, with -DDECLSPEC="
+            sdl_ok=yes
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Asks an sdl-config or sdl2-config script for its flags.
+sdl_try_config() {
+    test -x "$1" || return 1
+    sdl_try "$1" "$($1 --cflags 2>/dev/null)" "$($1 --libs 2>/dev/null)"
+}
+
+# Asks pkg-config for sdl2 (or sdl). $1 is the search path; when $2 is "only"
+# the default system directories are excluded, so a named prefix cannot quietly
+# resolve to a system-wide SDL instead.
+sdl_try_pkgconfig() {
+    _path=$1
+    _only=$2
+    if [ "$_only" = only ]; then
+        test -n "$_path" || return 1
+        _env="PKG_CONFIG_PATH=$_path PKG_CONFIG_LIBDIR=$_path"
+    else
+        _env="PKG_CONFIG_PATH=$_path"
+    fi
+    # shellcheck disable=SC2086
+    env $_env $pkg_config --exists "$sdl_pc" 2>>$log || return 1
+    # shellcheck disable=SC2086
+    sdl_try "$pkg_config${_only:+ (restricted)}" \
+        "$(env $_env $pkg_config --cflags "$sdl_pc" 2>/dev/null)" \
+        "$(env $_env $pkg_config --libs   "$sdl_pc" 2>/dev/null)"
+}
+
+# Looks for the header and library on their own, under prefix $1. Plenty of
+# hand-built SDL trees ship neither an SDL .pc file nor an sdl-config.
+sdl_try_prefix() {
+    _p=$1
+    test -d "$_p" || return 1
+    for _sub in $sdl_incdirs; do
+        _inc=$_p/$_sub
+        test -f "$_inc/SDL.h" || continue
+        for _lib in "$_p/lib" "$_p/lib64"; do
+            test -d "$_lib" || continue
+            sdl_try "$_p" "-D_REENTRANT -I$_inc" \
+                          "-L$_lib $sdl_lib -lpthread" && return 0
+        done
+    done
+    return 1
+}
+
+# Collects the pkgconfig directories belonging to prefix $1.
+pc_dirs_of() {
+    _out=
+    for _d in "$1/lib/pkgconfig" "$1/lib64/pkgconfig" "$1/share/pkgconfig"; do
+        test -d "$_d" && _out=${_out:+$_out:}$_d
+    done
+    printf '%s' "$_out"
+}
+
+checking "for $sdl_label"
+
+if [ -n "$sdl_config" ]; then
+    # An explicitly named script, and nothing else.
+    sdl_try_config "$sdl_config" || {
+        test -x "$sdl_config" \
+            && die "$sdl_config was found but a test program would not link against it" \
+"config.log has the compiler error. The usual causes are headers and a library
+from different installs, or a library built for another architecture."
+        die "no such $sdl_config_name: $sdl_config"
+    }
+
+elif [ -n "$sdl_prefix" ]; then
+    # A named prefix has to be the SDL that gets used. Falling back to a
+    # system-wide copy here would build against something other than what was
+    # asked for and only show up as a puzzling run-time mismatch.
+    test -d "$sdl_prefix" || die "no such directory: $sdl_prefix"
+
+    sdl_try_config "$sdl_prefix/bin/$sdl_config_name" \
+        || sdl_try_pkgconfig "$(pc_dirs_of "$sdl_prefix")" only \
+        || sdl_try_prefix "$sdl_prefix" \
+        || die "no usable $sdl_label under $sdl_prefix" \
+"Looked for:
+  $sdl_prefix/bin/$sdl_config_name
+  $sdl_prefix/lib/pkgconfig/$sdl_pc.pc  (and lib64, share)
+  $sdl_prefix/include/*/SDL.h with $sdl_prefix/lib/lib${sdl_lib#-l}  (and lib64)
+
+If the headers and the library live under different roots, name them through
+CFLAGS and LDFLAGS instead:
+
+  ./configure CFLAGS=-I/some/where/include/SDL2 LDFLAGS='-L/else/where/lib'
+
+config.log has each command that was tried."
+
+else
+    # CFLAGS or LDFLAGS carrying a -I or -L is someone naming an SDL by hand,
+    # usually because its headers and library sit under unrelated roots. Try that
+    # before pkg-config, or a system-wide .pc file would win and the paths just
+    # given would be silently ignored.
+    user_paths=no
+    case " $CFLAGS $LDFLAGS " in
+    *" -I"*|*" -L"*) user_paths=yes ;;
+    esac
+
+    pcpath=$PKG_CONFIG_PATH
+    for p in $extra_prefixes; do
+        d=$(pc_dirs_of "$p")
+        test -n "$d" && pcpath=${pcpath:+$pcpath:}$d
+    done
+
+    { test $user_paths = yes &&
+        sdl_try "CFLAGS and LDFLAGS" "-D_REENTRANT" "$sdl_lib -lpthread"; } \
+        || sdl_try_pkgconfig "$pcpath" \
+        || sdl_try_config "$(command -v $sdl_config_name 2>/dev/null || echo /nonexistent)" \
+        || { for p in $extra_prefixes; do sdl_try_prefix "$p" && break; done; } \
+        || sdl_try "compiler default search path" "-D_REENTRANT" "$sdl_lib" \
+        || die "could not find a usable $sdl_label" \
+"Install the $sdl_label development package ($sdl_devpkg), or point
+this script at an existing copy:
+
+  ./configure --with-sdl-prefix=/where/sdl/lives
+  ./configure --with-sdl-config=/where/sdl/lives/bin/$sdl_config_name
+  PKG_CONFIG_PATH=/where/sdl/lives/lib/pkgconfig ./configure
+
+config.log has each command that was tried."
+fi
+
+test $sdl_ok = yes || die "internal error: the $sdl_label probe fell through"
+sayln "yes ($sdl_how)"
+
+# --------------------------------------------------------------------- rpath
+#
+# A -L outside the loader's default path needs a matching -rpath, or the binary
+# links against the SDL that was configured and then silently loads a
+# different one at run time. That failure is confusing enough to be worth
+# handling by default.
+
+rpath_flags=
+have_rpath=no
+case " $sdl_libs " in
+*" -Wl,-R"*|*-rpath*) have_rpath=yes ;;   # pkg-config already supplied one
+esac
+
+if [ $enable_rpath != no ] && [ $have_rpath = no ]; then
+    sdl_libdir=
+    for tok in $sdl_libs; do
+        case $tok in -L*) sdl_libdir=${tok#-L} ;; esac
+    done
+
+    if [ -n "$sdl_libdir" ]; then
+        is_default=no
+        for d in /lib /usr/lib /lib64 /usr/lib64 \
+                 /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu; do
+            test "$sdl_libdir" = "$d" && is_default=yes
+        done
+
+        if [ $is_default = no ] || [ $enable_rpath = yes ]; then
+            checking "whether $CC accepts -Wl,-rpath"
+            if try $CC $std -o "$tmpdir/conf" "$tmpdir/conf.c" "-Wl,-rpath,$sdl_libdir"; then
+                rpath_flags="-Wl,-rpath,$sdl_libdir"
+                sayln "yes"
+            else
+                sayln "no"
+            fi
+        fi
+    fi
+fi
+
+# --------------------------------------------------------------- SDL version
+#
+# Asking the library that actually loads, rather than whichever .pc file was
+# read, is what catches an install whose headers and shared object disagree. The
+# rpath has to be in place first or this reports whatever the loader picks up
+# from the default search path, which is the very mix-up being checked for.
+
+checking "$sdl_label version"
+sdl_version=
+# shellcheck disable=SC2086
+if try $CC $std $CFLAGS $sdl_cflags -o "$tmpdir/sdlver" "$tmpdir/sdltest.c" \
+        $LDFLAGS $sdl_libs $rpath_flags; then
+    sdl_version=$("$tmpdir/sdlver" 2>>$log || true)
+fi
+
+if [ -z "$sdl_version" ]; then
+    sayln "unknown (could not run the test program)"
+else
+    case $sdl_version in
+    1.2.*) got_api=1 ;;
+    2.*)   got_api=2 ;;
+    *)     got_api=unknown ;;
+    esac
+
+    if [ "$got_api" = "$sdl_api" ]; then
+        sayln "$sdl_version"
+    else
+        die "the SDL that loads at run time reports version $sdl_version" \
+"This build was asked for $sdl_label. Either the headers being compiled against
+and the library being loaded are not the same install, or the wrong backend was
+selected: --with-sdl1 and --with-sdl2 pick between them."
+    fi
+
+    # The headers say one thing, the loaded library another: that is a broken
+    # install and the resulting binary would misbehave in ways no amount of
+    # debugging the game would explain.
+    hdr_version=$(printf '%s\n' "$sdl_cflags" | tr ' ' '\n' | sed -n 's/^-I//p' |
+        while read -r d; do
+            if [ -f "$d/SDL_version.h" ]; then
+                awk '/#define SDL_MAJOR_VERSION/ {maj=$3}
+                     /#define SDL_MINOR_VERSION/ {min=$3}
+                     /#define SDL_PATCHLEVEL/    {pat=$3}
+                     END { if (maj != "") printf "%s.%s.%s", maj, min, pat }' \
+                    "$d/SDL_version.h"
+                break
+            fi
+        done)
+
+    if [ -n "$hdr_version" ] && [ "$hdr_version" != "$sdl_version" ]; then
+        sayln "configure: warning: headers are SDL $hdr_version but the library"
+        sayln "configure: warning: that loads is SDL $sdl_version."
+        if [ $enable_rpath = no ]; then
+            sayln "configure: warning: you passed --disable-rpath; without it the"
+            sayln "configure: warning: loader is free to pick a different SDL."
+        else
+            sayln "configure: warning: check for another libSDL2 earlier in the"
+            sayln "configure: warning: loader path (try: ldd on the built binary)."
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------- build flags
+
+opt="-O2 -g"
+test $enable_debug = yes && opt="-O0 -g3 -DCOAB_DEBUG=1"
+
+san=
+if [ $enable_sanitizers = yes ]; then
+    checking "whether $CC supports -fsanitize=address,undefined"
+    if try $CC $std -fsanitize=address,undefined -o "$tmpdir/conf" "$tmpdir/conf.c"; then
+        san="-fsanitize=address,undefined -fno-omit-frame-pointer"
+        sayln "yes"
+    else
+        sayln "no"
+        sayln "configure: warning: sanitizers requested but unsupported; ignoring"
+    fi
+fi
+
+defs=$sdl_def
+sdl_nosound=
+test $sdl_api = 1 && sdl_nosound=" - no sound"
+
+if [ -n "$game_data" ]; then
+    case $game_data in
+    /*) ;;
+    *)  sayln "configure: warning: --with-game-data should be an absolute path" ;;
+    esac
+    defs="$defs -DCOAB_DATA_DIR=\\\"$game_data\\\""
+fi
+
+# ------------------------------------------------------------------ config.mk
+
+cat > config.mk <<EOF
+# Generated by ./configure -- edit configure or re-run it, not this file.
+CONFIGURED  := yes
+CC          := $CC
+STD         := $std
+OPT         := $opt
+SAN         := $san
+SDL_CFLAGS  := $sdl_cflags
+SDL_LIBS    := $sdl_libs $rpath_flags
+SDL_DEF     := $defs
+SDL_NAME    := $sdl_label ${sdl_version:+$sdl_version }($sdl_how)${sdl_nosound}
+EXTRA_CFLAGS := $CFLAGS
+EXTRA_LDFLAGS := $LDFLAGS
+PREFIX      := $prefix
+EXEC_PREFIX := $exec_prefix
+BINDIR      := $bindir
+DATAROOTDIR := $datarootdir
+GAME_DATA   := $game_data
+EOF
+
+sayln ""
+sayln "  compiler       : $CC $std $opt${san:+ $san}"
+sayln "  SDL            : $sdl_label ${sdl_version:-unknown} via $sdl_how${sdl_nosound}"
+sayln "  SDL cflags     : $sdl_cflags"
+sayln "  SDL libs       : $sdl_libs${rpath_flags:+ $rpath_flags}"
+sayln "  install prefix : $prefix"
+sayln "  game data      : ${game_data:-searched at run time}"
+sayln ""
+sayln "Wrote config.mk. Now run:  make        (then: make test, make install)"
