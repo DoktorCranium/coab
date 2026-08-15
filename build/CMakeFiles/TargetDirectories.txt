@@ -1,0 +1,8 @@
+/Users/user/KVM/OpenVMS-8.4/COAB/coab/build/CMakeFiles/coab.dir
+/Users/user/KVM/OpenVMS-8.4/COAB/coab/build/CMakeFiles/test.dir
+/Users/user/KVM/OpenVMS-8.4/COAB/coab/build/CMakeFiles/edit_cache.dir
+/Users/user/KVM/OpenVMS-8.4/COAB/coab/build/CMakeFiles/rebuild_cache.dir
+/Users/user/KVM/OpenVMS-8.4/COAB/coab/build/CMakeFiles/list_install_components.dir
+/Users/user/KVM/OpenVMS-8.4/COAB/coab/build/CMakeFiles/install.dir
+/Users/user/KVM/OpenVMS-8.4/COAB/coab/build/CMakeFiles/install/local.dir
+/Users/user/KVM/OpenVMS-8.4/COAB/coab/build/CMakeFiles/install/strip.dir
